@@ -36,7 +36,6 @@ import (
 	"time"
 
 	"github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
-	"github.com/digitorus/timestamp"
 	"github.com/go-openapi/runtime"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -72,7 +71,6 @@ import (
 	"github.com/sigstore/sigstore/pkg/signature/dsse"
 	"github.com/sigstore/sigstore/pkg/signature/options"
 	"github.com/sigstore/sigstore/pkg/tuf"
-	tsaverification "github.com/sigstore/timestamp-authority/pkg/verification"
 )
 
 // Identity specifies an issuer/subject to verify a signature against.
@@ -762,18 +760,7 @@ func verifySignatures(ctx context.Context, sigs oci.Signatures, h v1.Hash, co *C
 func verifyInternal(ctx context.Context, sig oci.Signature, h v1.Hash,
 	verifyFn signatureVerificationFn, co *CheckOpts) (
 	bundleVerified bool, err error) {
-	var acceptableRFC3161Time, acceptableRekorBundleTime *time.Time // Timestamps for the signature we accept, or nil if not applicable.
-
-	var acceptableRFC3161Timestamp *timestamp.Timestamp
-	if co.UseSignedTimestamps {
-		acceptableRFC3161Timestamp, err = VerifyRFC3161Timestamp(sig, co)
-		if err != nil {
-			return false, fmt.Errorf("unable to verify RFC3161 timestamp bundle: %w", err)
-		}
-		if acceptableRFC3161Timestamp != nil {
-			acceptableRFC3161Time = &acceptableRFC3161Timestamp.Time
-		}
-	}
+	var acceptableRekorBundleTime *time.Time // Timestamps for the signature we accept, or nil if not applicable.
 
 	if !co.IgnoreTlog {
 		bundleVerified, err = VerifyBundle(sig, co)
@@ -874,14 +861,6 @@ func verifyInternal(ctx context.Context, sig oci.Signature, h v1.Hash,
 		// use the provided Rekor bundle or RFC3161 timestamp to check certificate expiration
 		expirationChecked := false
 
-		if acceptableRFC3161Time != nil {
-			// Verify the cert against the timestamp time.
-			if err := CheckExpiry(cert, *acceptableRFC3161Time); err != nil {
-				return false, fmt.Errorf("checking expiry on certificate with timestamp: %w", err)
-			}
-			expirationChecked = true
-		}
-
 		if acceptableRekorBundleTime != nil {
 			if err := CheckExpiry(cert, *acceptableRekorBundleTime); err != nil {
 				return false, fmt.Errorf("checking expiry on certificate with bundle: %w", err)
@@ -893,7 +872,7 @@ func verifyInternal(ctx context.Context, sig oci.Signature, h v1.Hash,
 		if !expirationChecked {
 			if err := CheckExpiry(cert, time.Now()); err != nil {
 				// If certificate is expired and not signed timestamp was provided then error the following message. Otherwise throw an expiration error.
-				if co.IgnoreTlog && acceptableRFC3161Time == nil {
+				if co.IgnoreTlog {
 					return false, &VerificationFailure{
 						fmt.Errorf("expected a signed timestamp to verify an expired certificate"),
 					}
@@ -1218,51 +1197,6 @@ func VerifyBundle(sig oci.Signature, co *CheckOpts) (bool, error) {
 		return false, fmt.Errorf("matching bundle to payload: bundle=%q, payload=%q", bundlehash, payloadHash)
 	}
 	return true, nil
-}
-
-// VerifyRFC3161Timestamp verifies that the timestamp in sig is correctly signed, and if so,
-// returns the timestamp value.
-// It returns (nil, nil) if there is no timestamp, or (nil, err) if there is an invalid timestamp or if
-// no root is provided with a timestamp.
-func VerifyRFC3161Timestamp(sig oci.Signature, co *CheckOpts) (*timestamp.Timestamp, error) {
-	ts, err := sig.RFC3161Timestamp()
-	switch {
-	case err != nil:
-		return nil, err
-	case ts == nil:
-		return nil, nil
-	case co.TSARootCertificates == nil:
-		return nil, errors.New("no TSA root certificate(s) provided to verify timestamp")
-	}
-
-	b64Sig, err := sig.Base64Signature()
-	if err != nil {
-		return nil, fmt.Errorf("reading base64signature: %w", err)
-	}
-
-	var tsBytes []byte
-	if len(b64Sig) == 0 {
-		// For attestations, the Base64Signature is not set, therefore we rely on the signed payload
-		signedPayload, err := sig.Payload()
-		if err != nil {
-			return nil, fmt.Errorf("reading the payload: %w", err)
-		}
-		tsBytes = signedPayload
-	} else {
-		// create timestamp over raw bytes of signature
-		rawSig, err := base64.StdEncoding.DecodeString(b64Sig)
-		if err != nil {
-			return nil, err
-		}
-		tsBytes = rawSig
-	}
-
-	return tsaverification.VerifyTimestampResponse(ts.SignedRFC3161Timestamp, bytes.NewReader(tsBytes),
-		tsaverification.VerifyOpts{
-			TSACertificate: co.TSACertificate,
-			Intermediates:  co.TSAIntermediateCertificates,
-			Roots:          co.TSARootCertificates,
-		})
 }
 
 // compare bundle signature to the signature we are verifying
